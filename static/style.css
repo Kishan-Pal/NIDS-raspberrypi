@@ -1,0 +1,31 @@
+body {
+  font-family: Arial, sans-serif;
+  padding: 20px;
+  background-color: #f8f9fa;
+}
+
+h1 {
+  text-align: center;
+  margin-bottom: 30px;
+}
+
+.sensor-box {
+  text-align: center;
+  margin-bottom: 30px;
+  background: #fff;
+  padding: 20px;
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.charts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  justify-content: center;
+}
+
+#temperature-history, #humidity-history {
+  width: 450px;
+  height: 300px;
+}

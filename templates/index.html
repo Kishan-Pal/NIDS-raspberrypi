@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Raspberry Pi Sensor Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+</head>
+<body>
+  <h1>Raspberry Pi Sensor Dashboard</h1>
+
+  <div class="sensor-box">
+    <h2>Current Readings</h2>
+    <p><strong>Temperature:</strong> <span id="temperature">--</span></p>
+    <p><strong>Humidity:</strong> <span id="humidity">--</span></p>
+  </div>
+
+  <div class="charts">
+    <div id="temperature-history"></div>
+    <div id="humidity-history"></div>
+  </div>
+
+  <script>
+    let tempX = [], tempY = [], humidX = [], humidY = [];
+    let count = 0;
+    const MAX_POINTS = 20;
+
+    Plotly.newPlot("temperature-history", [{ x: [], y: [], mode: "lines+markers", name: "Temperature (°C)", line: { color: "red" } }], { title: "Temperature Over Time" });
+    Plotly.newPlot("humidity-history", [{ x: [], y: [], mode: "lines+markers", name: "Humidity (%)", line: { color: "blue" } }], { title: "Humidity Over Time" });
+
+    function updateDashboard() {
+      fetch('/sensor-readings')
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('temperature').innerText = data.temperature + ' °C';
+          document.getElementById('humidity').innerText = data.humidity + ' %';
+
+          // Update temp chart
+          if (tempX.length >= MAX_POINTS) tempX.shift(), tempY.shift();
+          tempX.push(count); tempY.push(data.temperature);
+          Plotly.update("temperature-history", { x: [tempX], y: [tempY] });
+
+          // Update humidity chart
+          if (humidX.length >= MAX_POINTS) humidX.shift(), humidY.shift();
+          humidX.push(count); humidY.push(data.humidity);
+          Plotly.update("humidity-history", { x: [humidX], y: [humidY] });
+
+          count++;
+        });
+    }
+
+    setInterval(updateDashboard, 1000);
+  </script>
+</body>
+</html>
