@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+capture_v3.py - CICIoMT2024-aligned feature extractor for Raspberry Pi
+
+Key improvements:
+ - Rate: packets per second
+ - psh_flag_number: ratio (psh_packets / total_packets)
+ - ack/syn/rst counts: integer counts
+ - Protocol fields: normalized fractions
+ - IAT: mean inter-arrival time in seconds (<1 for normal traffic)
+"""
+
 import time
 import traceback
 import requests
@@ -5,43 +17,165 @@ import pyshark
 from statistics import stdev
 from collections import defaultdict
 import math
-import json
-import subprocess
 import threading
+import json
+import ipaddress
+import subprocess
+import logging
+import time
+
+# These IPs will NEVER be blocked
+WHITELIST = {
+    "127.0.0.1",
+    "localhost",
+    "192.168.0.1",      # Example network
+    "192.168.0.101",      # Example network
+    "192.168.0.102",      # Example network
+    "192.168.137.127",   # Your Pi (REPLACE THIS with Pi’s real IP)
+    "192.168.137.1", 
+    "fe80::2ff:c292:76f1:1b22"  # Your Pi (REPLACE THIS with Pi’s real IP)
+}
+
+
 
 # ---------------- CONFIGURATION ---------------- #
-INTERFACE = 'wlan0'
+INTERFACE = 'eth0'
 WINDOW_SECONDS = 3
-BACKEND_URL1 = 'http://192.168.0.106:8000/predict'
-BACKEND_URL2 = 'http://10.227.106.101:8000/predict_batch'
+BACKEND_URL1 = 'http://192.168.0.101:8000/predict'
+BACKEND_URL2 = 'http://192.168.0.101:8000/predict_batch'
 SEND_BATCH = True
-IPSET_NAME = "ddos_blocklist"
 # ------------------------------------------------ #
-
-# blocked_ips: { ip: blocked_at_timestamp }
-blocked_ips = {}
-blocked_lock = threading.Lock()
 
 FEATURE_ORDER = [
     "Time_To_Live", "Rate", "psh_flag_number", "ack_count", "syn_count", "rst_count",
     "DNS", "TCP", "UDP", "ARP", "ICMP", "IPv", "Std", "Tot size", "IAT"
 ]
 
+# Create a logger (optional but recommended)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("capture_v3")
+
+# Internal record of blocked IPs
+blocked_ips = {}
+blocked_lock = threading.Lock()
+
+# Name of ipset set (must exist beforehand)
+IPSET_NAME = "blocked_ips"
+
 def safe_div(a, b, fallback=0.0):
     return a / b if b else fallback
 
-def add_block(ip):
-    """Add IP to ipset and internal blocked list."""
-    blocked_at = int(time.time())
-    with blocked_lock:
-        blocked_ips[ip] = blocked_at
-
-    # Add to ipset (best-effort)
+def is_valid_ip(ip):
+    """Returns True if ip is valid IPv4 or IPv6."""
     try:
-        subprocess.run(['sudo','ipset','add', IPSET_NAME, ip], check=False)
-        print('Added %s to ipset %s', ip, IPSET_NAME)
+        ipaddress.ip_address(ip)
+        return True
+    except Exception:
+        return False
+
+
+def add_block(ip):
+    """
+    Add IP to ipset safely unless it is whitelisted.
+    """
+
+    # ------------------------------
+    # ✅ DO NOT BLOCK WHITELISTED IPS
+    # ------------------------------
+    if ip in WHITELIST:
+        logger.warning(f"[BLOCK] Skipping whitelisted IP: {ip}")
+        return False
+
+    # ------------------------------
+    # ✅ DO NOT BLOCK INVALID IPS
+    # ------------------------------
+    if not is_valid_ip(ip):
+        logger.warning(f"[BLOCK] Ignoring invalid IP: {ip}")
+        return False
+
+    ts = int(time.time())
+
+    # ------------------------------
+    # ✅ CHECK ALREADY BLOCKED
+    # ------------------------------
+    with blocked_lock:
+        if ip in blocked_ips:
+            logger.info(f"[BLOCK] IP already blocked: {ip}")
+            return False
+        blocked_ips[ip] = ts
+
+    # ------------------------------
+    # ✅ ADD TO IPSET
+    # ------------------------------
+    try:
+        result = subprocess.run(
+            ["sudo", "ipset", "add", IPSET_NAME, ip, "-exist"],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            logger.error(f"[BLOCK] ipset error for {ip}: {result.stderr}")
+            return False
+
+        logger.info(f"[BLOCK] ✅ BLOCKED {ip} at {ts}")
+        return True
+
     except Exception as e:
-        print('Failed to add ip to ipset: %s', e)
+        logger.error(f"[BLOCK] Exception blocking {ip}: {e}")
+        return False
+
+
+def send_to_backend(batch):
+    """
+    Robust POST handler:
+       ✅ Validates server response
+       ✅ Extracts 'attack' safely
+       ✅ Calls add_block(ip) for each attacker
+       ✅ Logs everything
+       ✅ Survives malformed JSON
+    """
+
+    if not SEND_BATCH:
+        logger.info("[SEND] SEND_BATCH=False, skipping")
+        return
+
+    if not batch:
+        logger.info("[SEND] Empty batch, nothing to send")
+        return
+
+    try:
+        r = requests.post(BACKEND_URL2, json=batch, timeout=10)
+        logger.info(f"[SEND] /predict_batch -> {r.status_code}")
+
+        # log full response text
+        logger.info(f"[SEND] Response: {r.text}")
+
+        if r.status_code != 200:
+            logger.error(f"[SEND] Backend returned error code {r.status_code}")
+            return
+
+        # JSON parsing
+        try:
+            response = r.json()
+        except Exception:
+            logger.error("[SEND] Failed to parse JSON from backend")
+            return
+
+        attack_ips = response.get("attack", [])
+        if not isinstance(attack_ips, list):
+            logger.error("[SEND] 'attack' field not a list")
+            return
+
+        for ip in attack_ips:
+            if not isinstance(ip, str):
+                logger.warning(f"[SEND] Skipping non-string IP: {ip}")
+                continue
+            add_block(ip.strip())
+
+    except Exception as e:
+        logger.error(f"[SEND] Exception during backend POST: {e}")
+
 
 def compute_window_features(bucket):
     sizes = bucket['sizes']
@@ -113,18 +247,24 @@ def compute_window_features(bucket):
     }
     return feat
 
-def send_to_backend(batch):
-    if not SEND_BATCH:
-        print("[INFO] SEND_BATCH is False — skipping HTTP send.")
-        return
-    try:
-        response = requests.post(BACKEND_URL2, json=batch, timeout=10)
-        attack_ips = response['attack']
-        for ip in attack_ips:
-            add_block(ip)
-        print(f"[INFO] /predict_batch -> {response.status_code}, {response.text}")
-    except Exception as e:
-        print(f"[ERROR] POST {BACKEND_URL2}: {e}")
+# def send_to_backend(batch):
+#     if not SEND_BATCH:
+#         print("[INFO] SEND_BATCH is False — skipping HTTP send.")
+#         return
+#     # try:
+#     #     r1 = requests.post(BACKEND_URL1, json=batch, timeout=10)
+#     #     print(f"[INFO] /predict -> {r1.status_code}, {r1.text}")
+#     # except Exception as e:
+#     #     print(f"[ERROR] POST {BACKEND_URL1}: {e}")
+#     try:
+#         r2 = requests.post(BACKEND_URL2, json=batch, timeout=10)
+#         print(f"[INFO] /predict_batch -> {r2.status_code}, {r2.text}")
+#         response = r2.json()
+#         attack_ips = response.get('attack', [])
+#         for ip in attack_ips:
+#             add_block(ip)
+#     except Exception as e:
+#         print(f"[ERROR] POST {BACKEND_URL2}: {e}")
 
 def live_capture():
     print(f"[*] Starting live capture on {INTERFACE} ...")
